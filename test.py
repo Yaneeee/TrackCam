@@ -1,5 +1,7 @@
 import sys
 import time
+import subprocess
+import shutil
 import cv2
 import numpy as np
 import xml.etree.ElementTree as ET
@@ -12,6 +14,217 @@ from PySide6.QtWidgets import (
     QPushButton, QSlider, QLabel, QComboBox, QFileDialog, QDoubleSpinBox,
     QSpinBox, QGroupBox, QFormLayout, QColorDialog, QScrollArea, QCheckBox
 )
+
+
+# ═══════════════════ 硬件与编码器检测 ═══════════════════
+
+def _probe_cuda() -> bool:
+    try:
+        return cv2.cuda.getCudaEnabledDeviceCount() > 0
+    except Exception:
+        return False
+
+CUDA_OK = _probe_cuda()
+
+
+def _probe_ffmpeg():
+    if not shutil.which("ffmpeg"):
+        return False, set()
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=5)
+        text = r.stdout + r.stderr
+    except Exception:
+        return False, set()
+    wanted = {
+        "h264_nvenc", "hevc_nvenc",
+        "h264_qsv", "hevc_qsv", "av1_qsv",
+        "h264_vaapi", "hevc_vaapi",
+        "h264_videotoolbox", "hevc_videotoolbox",
+        "h264_amf", "hevc_amf",
+        "libx265", "libvpx-vp9", "libsvtav1",
+    }
+    found = set()
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].startswith(('V', '.')):
+            if parts[1] in wanted:
+                found.add(parts[1])
+    return True, found
+
+
+FFMPEG_OK, FFMPEG_ENC = _probe_ffmpeg()
+
+# (显示名, 类型, 编码器标识, 默认扩展名, 是否硬件)
+_CODEC_DEFS = [
+    ("H.264 (软件)",       "opencv", "H264",          ".mp4", False),
+    ("MPEG-4 (XVID)",      "opencv", "XVID",          ".avi", False),
+    ("MJPEG",              "opencv", "MJPG",          ".avi", False),
+    ("无压缩 RGB",         "opencv", "DIB ",          ".avi", False),
+    ("H.265/HEVC (软件)",  "ffmpeg", "libx265",       ".mp4", False),
+    ("VP9",                "ffmpeg", "libvpx-vp9",    ".mp4", False),
+    ("AV1 (SVT-AV1)",      "ffmpeg", "libsvtav1",     ".mp4", False),
+    ("H.264 NVENC",        "ffmpeg", "h264_nvenc",    ".mp4", True),
+    ("H.265 NVENC",        "ffmpeg", "hevc_nvenc",    ".mp4", True),
+    ("H.264 QSV",          "ffmpeg", "h264_qsv",      ".mp4", True),
+    ("H.265 QSV",          "ffmpeg", "hevc_qsv",      ".mp4", True),
+    ("AV1 QSV",            "ffmpeg", "av1_qsv",       ".mp4", True),
+    ("H.264 VAAPI",        "ffmpeg", "h264_vaapi",    ".mp4", True),
+    ("H.265 VAAPI",        "ffmpeg", "hevc_vaapi",    ".mp4", True),
+    ("H.264 AMF (AMD)",    "ffmpeg", "h264_amf",      ".mp4", True),
+    ("H.265 AMF (AMD)",    "ffmpeg", "hevc_amf",      ".mp4", True),
+    ("H.264 VideoToolbox",  "ffmpeg", "h264_videotoolbox", ".mp4", True),
+    ("H.265 VideoToolbox",  "ffmpeg", "hevc_videotoolbox", ".mp4", True),
+]
+
+
+def _available_codecs():
+    out = []
+    for d, ct, cd, ext, hw in _CODEC_DEFS:
+        if ct == "opencv":
+            out.append((d, ct, cd, ext, hw))
+        elif ct == "ffmpeg" and FFMPEG_OK:
+            if hw and cd not in FFMPEG_ENC:
+                continue
+            out.append((d, ct, cd, ext, hw))
+    return out
+
+
+_PRESET_MAP = {
+    "nvenc": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
+    "qsv":   ["veryfast", "faster", "fast", "medium", "slow", "slower"],
+    "vaapi": ["speed", "balanced", "quality"],
+    "amf":   ["speed", "balanced", "quality"],
+    "vt":    ["default"],
+    "x26x":  ["ultrafast", "superfast", "veryfast", "faster", "fast",
+              "medium", "slow", "slower", "veryslow"],
+    "vp9":   ["realtime", "good", "best"],
+    "av1":   ["0", "4", "6", "8", "10", "12", "13"],
+}
+
+
+def _preset_family(codec: str) -> str:
+    if "nvenc" in codec:        return "nvenc"
+    if "qsv" in codec:          return "qsv"
+    if "vaapi" in codec:        return "vaapi"
+    if "amf" in codec:          return "amf"
+    if "videotoolbox" in codec: return "vt"
+    if "libx26" in codec:       return "x26x"
+    if "vp9" in codec:          return "vp9"
+    if "av1" in codec or "svtav1" in codec: return "av1"
+    return ""
+
+
+# ═══════════════════ FFmpeg 编码器 ═══════════════════
+
+class FFmpegWriter:
+    """通过 ffmpeg 子进程 pipe 帧数据，支持硬件加速编码"""
+
+    def __init__(self, path, fps, w, h, codec,
+                 bitrate_kbps=0, preset="", crf=-1):
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+            "-f", "rawvideo", "-vcodec", "rawvideo",
+            "-s", f"{w}x{h}", "-pix_fmt", "bgr24",
+            "-r", f"{fps:.2f}", "-i", "pipe:0",
+            "-c:v", codec,
+        ]
+        fam = _preset_family(codec)
+
+        if fam == "vaapi":
+            cmd += ["-vaapi_device", "/dev/dri/renderD128",
+                    "-vf", "format=nv12,hwupload"]
+
+        pv = preset.strip()
+        if pv and pv != "default":
+            if fam == "vp9":
+                cmd += ["-deadline", pv,
+                        "-cpu-used",
+                        {"realtime": "5", "good": "2", "best": "0"
+                         }.get(pv, "2")]
+            else:
+                cmd += ["-preset", pv]
+
+        if bitrate_kbps > 0:
+            cmd += ["-b:v", f"{bitrate_kbps}k"]
+        elif crf >= 0:
+            if fam == "nvenc":
+                cmd += ["-cq", str(crf)]
+            else:
+                cmd += ["-crf", str(crf)]
+
+        if fam == "qsv":
+            cmd += ["-pix_fmt", "nv12"]
+        elif fam != "vaapi":
+            cmd += ["-pix_fmt", "yuv420p"]
+
+        cmd.append(path)
+        self._proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+    @property
+    def is_opened(self):
+        return self._proc is not None and self._proc.poll() is None
+
+    def write(self, frame):
+        if not self.is_opened:
+            return False
+        try:
+            self._proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+            return True
+        except (BrokenPipeError, OSError):
+            return False
+
+    def release(self):
+        if self._proc is None:
+            return
+        try:
+            self._proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            _, err = self._proc.communicate(timeout=15)
+            if self._proc.returncode != 0:
+                print(f"[FFmpeg 错误] {err.decode(errors='replace')[:500]}")
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            self._proc.wait()
+        self._proc = None
+
+
+# ═══════════════════ 统一导出写入器 ═══════════════════
+
+class ExportWriter:
+    """统一 OpenCV / FFmpeg 写入接口"""
+
+    def __init__(self, path, fps, w, h, codec_info,
+                 bitrate=0, preset="", crf=-1):
+        _display, self._ctype, self._codec, _ext, _hw = codec_info
+        if self._ctype == "ffmpeg":
+            self._w = FFmpegWriter(
+                path, fps, w, h, self._codec,
+                bitrate_kbps=bitrate, preset=preset, crf=crf)
+        else:
+            fourcc = cv2.VideoWriter_fourcc(*self._codec)
+            self._w = cv2.VideoWriter(path, fourcc, fps, (w, h))
+
+    @property
+    def is_opened(self):
+        if self._ctype == "ffmpeg":
+            return self._w.is_opened
+        return self._w.isOpened()
+
+    def write(self, frame):
+        if self._ctype == "ffmpeg":
+            return self._w.write(frame)
+        else:
+            self._w.write(frame)
+            return True
+
+    def release(self):
+        self._w.release()
 
 
 # ═══════════════════ 数据 ═══════════════════
@@ -295,11 +508,12 @@ def safe_imread(path):
     return cv2.imread(path)
 
 
-# ═══════════════════ 渲染引擎 ═══════════════════
+# ═══════════════════ 渲染引擎 (CUDA 加速) ═══════════════════
 
 class RenderEngine:
     def __init__(self):
         self.map_img = None
+        self._map_gpu = None
         self._sc = self._sa = self._ss = None
 
     def load_map(self, path):
@@ -308,6 +522,15 @@ class RenderEngine:
             self.map_img = cv2.imdecode(data, cv2.IMREAD_COLOR)
         except Exception:
             self.map_img = None
+        # 上传到 GPU 缓存
+        if CUDA_OK and self.map_img is not None:
+            try:
+                self._map_gpu = cv2.cuda_GpuMat()
+                self._map_gpu.upload(self.map_img)
+            except Exception:
+                self._map_gpu = None
+        else:
+            self._map_gpu = None
         return self.map_img is not None
 
     def reset(self):
@@ -365,11 +588,23 @@ class RenderEngine:
         M = cv2.getRotationMatrix2D(tuple(self._sc), self._sa, self._ss)
         M[0, 2] += tw / 2 - self._sc[0]
         M[1, 2] += th / 2 - self._sc[1]
-        if self.map_img is not None:
+
+        # CUDA 加速 warpAffine
+        if CUDA_OK and self._map_gpu is not None:
+            try:
+                gpu_dst = cv2.cuda.warpAffine(
+                    self._map_gpu, M, (tw, th),
+                    flags=cv2.INTER_LINEAR)
+                fr = gpu_dst.download()
+            except Exception:
+                fr = cv2.warpAffine(self.map_img, M, (tw, th),
+                                    flags=cv2.INTER_LINEAR)
+        elif self.map_img is not None:
             fr = cv2.warpAffine(self.map_img, M, (tw, th),
                                 flags=cv2.INTER_LINEAR)
         else:
             fr = np.zeros((th, tw, 3), np.uint8)
+
         if len(trail) > 1:
             d = np.array([[p.imageX + ox, p.imageY + oy] for p in trail],
                          np.float32)
@@ -486,11 +721,12 @@ class VideoPlayer(QMainWindow):
         self._num_laps = 0
         self._seg_images: Dict[int, np.ndarray] = {}
 
-        # 导出状态
         self._exporting = False
-        self._export_writer: Optional[cv2.VideoWriter] = None
+        self._export_writer: Optional[ExportWriter] = None
         self._export_idx = 0
         self._export_total = 0
+
+        self._codec_list = _available_codecs()
 
         self._ui()
         self._timer = QTimer()
@@ -732,35 +968,54 @@ class VideoPlayer(QMainWindow):
         ge.setLayout(fe)
         sl.addWidget(ge)
 
-        # ── 导出视频 ──
-        self.cb_export_fmt = QComboBox()
-        self.cb_export_fmt.addItems([
-            "AVI (无压缩)", "AVI (MJPG)", "MP4 (mp4v)", "MP4 (H264)"
-        ])
+        # ── 导出视频 (增强版) ──
+        self.cb_export_codec = QComboBox()
+        for display, _ct, _cd, _ext, _hw in self._codec_list:
+            tag = " [HW]" if _hw else ""
+            self.cb_export_codec.addItem(display + tag)
+        if self._codec_list:
+            self.cb_export_codec.setCurrentIndex(0)
+
+        self.cb_export_preset = QComboBox()
+        self.sp_export_br = QSpinBox()
+        self.sp_export_br.setRange(0, 200000)
+        self.sp_export_br.setValue(0)
+        self.sp_export_br.setSuffix(" kbps")
+        self.sp_export_crf = QSpinBox()
+        self.sp_export_crf.setRange(-1, 63)
+        self.sp_export_crf.setValue(-1)
+        self.sp_export_crf.setSuffix(" (-1=默认)")
         self.sp_export_fps = QSpinBox()
         self.sp_export_fps.setRange(10, 120)
         self.sp_export_fps.setValue(60)
         self.sp_export_fps.setSuffix(" FPS")
         self.sp_export_batch = QSpinBox()
-        self.sp_export_batch.setRange(1, 30)
+        self.sp_export_batch.setRange(1, 60)
         self.sp_export_batch.setValue(5)
         self.sp_export_batch.setSuffix(" 帧/tick")
         self.chk_export_no_dark = QCheckBox("导出时关闭暗化")
-        self.chk_export_no_dark.setChecked(True)  # ← 默认关闭暗化
+        self.chk_export_no_dark.setChecked(True)
         self.btn_export_start = QPushButton("导出视频")
         self.btn_export_cancel = QPushButton("取消导出")
         self.btn_export_cancel.setEnabled(False)
         self.lb_export = QLabel("")
+        self.lb_hw = QLabel("")
         self.sld_export = QSlider(Qt.Horizontal)
         self.sld_export.setEnabled(False)
+
+        self._update_presets()
+        self._update_hw_label()
 
         ge2 = QGroupBox("导出视频")
         fe2 = QFormLayout()
         fe2.setSpacing(4)
-        fe2.addRow("格式:", self.cb_export_fmt)
+        fe2.addRow("编码器:", self.cb_export_codec)
+        fe2.addRow("预设:", self.cb_export_preset)
+        fe2.addRow("码率:", self.sp_export_br)
+        fe2.addRow("质量CRF:", self.sp_export_crf)
         fe2.addRow("导出帧率:", self.sp_export_fps)
         fe2.addRow("批量帧数:", self.sp_export_batch)
-        fe2.addRow(self.chk_export_no_dark)  # ← 新增
+        fe2.addRow(self.chk_export_no_dark)
         row_exp = QHBoxLayout()
         row_exp.addWidget(self.btn_export_start)
         row_exp.addWidget(self.btn_export_cancel)
@@ -769,6 +1024,7 @@ class VideoPlayer(QMainWindow):
         fe2.addRow(exp_cont)
         fe2.addRow(self.sld_export)
         fe2.addRow("状态:", self.lb_export)
+        fe2.addRow("硬件:", self.lb_hw)
         ge2.setLayout(fe2)
         sl.addWidget(ge2)
 
@@ -792,7 +1048,7 @@ class VideoPlayer(QMainWindow):
         hc.addWidget(self.lb_i)
         layout.addLayout(hc)
         self.setCentralWidget(central)
-        self.setFixedWidth(340)
+        self.setFixedWidth(360)
 
         # 信号
         self.btn_map.clicked.connect(self._open_map)
@@ -808,6 +1064,7 @@ class VideoPlayer(QMainWindow):
         self.btn_seg_frame.clicked.connect(self._seg_from_frame)
         self.btn_export_start.clicked.connect(self._export_start)
         self.btn_export_cancel.clicked.connect(self._export_stop)
+        self.cb_export_codec.currentIndexChanged.connect(self._on_codec_changed)
 
         for cb in [self.cb_src_bg, self.cb_src_circ, self.cb_src_rect,
                    self.cb_src_seg]:
@@ -827,6 +1084,43 @@ class VideoPlayer(QMainWindow):
                 w.stateChanged.connect(self._on_param)
             if hasattr(w, 'currentTextChanged'):
                 w.currentTextChanged.connect(self._on_param)
+
+    # ── 编码器 UI 联动 ──
+
+    def _selected_codec_info(self):
+        idx = self.cb_export_codec.currentIndex()
+        if 0 <= idx < len(self._codec_list):
+            return self._codec_list[idx]
+        return None
+
+    def _on_codec_changed(self, _=None):
+        self._update_presets()
+
+    def _update_presets(self):
+        info = self._selected_codec_info()
+        self.cb_export_preset.clear()
+        if info is None:
+            return
+        _display, _ct, codec, _ext, _hw = info
+        fam = _preset_family(codec)
+        presets = _PRESET_MAP.get(fam, ["default"])
+        self.cb_export_preset.addItems(presets)
+        if presets:
+            self.cb_export_preset.setCurrentIndex(len(presets) // 2)
+        is_hw = _hw
+        self.sp_export_crf.setEnabled(not is_hw or "nvenc" in codec)
+        self.sp_export_br.setEnabled(True)
+
+    def _update_hw_label(self):
+        parts = [f"CUDA {'可用' if CUDA_OK else '不可用'}",
+                 f"FFmpeg {'可用' if FFMPEG_OK else '不可用'}"]
+        if FFMPEG_ENC:
+            hw_names = [e for e in FFMPEG_ENC
+                        if any(k in e for k in ("nvenc", "qsv", "vaapi",
+                                                 "amf", "videotoolbox"))]
+            if hw_names:
+                parts.append(f"HW编码器: {len(hw_names)}个")
+        self.lb_hw.setText(" | ".join(parts))
 
     # ── 分段 ──
 
@@ -863,7 +1157,8 @@ class VideoPlayer(QMainWindow):
             return
         n = self._num_laps
         start_lap = self._min_lap
-        self.lb_seg.setText(f"选区中... ({n}段, Lap {start_lap}~{self._max_lap})")
+        self.lb_seg.setText(
+            f"选区中... ({n}段, Lap {start_lap}~{self._max_lap})")
         QApplication.processEvents()
         roi = select_roi_on_image(img)
         if roi is None:
@@ -879,7 +1174,8 @@ class VideoPlayer(QMainWindow):
         rx, ry, rw, rh = roi
         a = rh / (n + 1)
         print(f"\n{'=' * 50}")
-        print(f"ROI: ({rx},{ry},{rw},{rh})  圈数:{n}  a={a:.1f}px  段高={2 * a:.1f}px")
+        print(f"ROI: ({rx},{ry},{rw},{rh})  圈数:{n}  "
+              f"a={a:.1f}px  段高={2 * a:.1f}px")
         print(f"{'=' * 50}")
         for idx, sx, sy, sw, sh in segs:
             lap = start_lap + idx
@@ -892,12 +1188,15 @@ class VideoPlayer(QMainWindow):
             print(f"  段{idx:2d} → Lap {lap:3d}  y={sy:5d} h={sh:5d}")
         ph2, pw2 = preview.shape[:2]
         ps2 = min(960 / pw2, 720 / ph2, 1.0)
-        prev = cv2.resize(preview, (max(1, int(pw2 * ps2)), max(1, int(ph2 * ps2))))
+        prev = cv2.resize(preview,
+                          (max(1, int(pw2 * ps2)), max(1, int(ph2 * ps2))))
         cv2.imshow("分段预览 (3秒)", prev)
         cv2.waitKey(3000)
         cv2.destroyWindow("分段预览 (3秒)")
-        self.lb_seg.setText(f"完成: {n}段 → Lap {start_lap}~{self._max_lap}")
-        self.lb_seg_detail.setText(f"a={a:.0f}px 段高={2 * a:.0f}px ROI=({rw}×{rh})")
+        self.lb_seg.setText(
+            f"完成: {n}段 → Lap {start_lap}~{self._max_lap}")
+        self.lb_seg_detail.setText(
+            f"a={a:.0f}px 段高={2 * a:.0f}px ROI=({rw}×{rh})")
 
     def _get_seg_for_lap(self, lap):
         return self._seg_images.get(lap)
@@ -917,7 +1216,7 @@ class VideoPlayer(QMainWindow):
         frac = (time_sec - t1) / (t2 - t1) if t2 > t1 else 0.0
         return lo + max(0.0, min(1.0, frac))
 
-    # ── 修改：导出开始 ──
+    # ── 导出 (增强版) ──
 
     def _export_start(self):
         if not self.td:
@@ -927,46 +1226,39 @@ class VideoPlayer(QMainWindow):
             self.lb_export.setText("正在导出中...")
             return
 
-        fmt_text = self.cb_export_fmt.currentText()
-        if "MP4" in fmt_text:
-            ext = "MP4 Files (*.mp4)"
-        else:
-            ext = "AVI Files (*.avi)"
-        path, _ = QFileDialog.getSaveFileName(self, "保存视频", "", ext)
+        info = self._selected_codec_info()
+        if info is None:
+            self.lb_export.setText("请选择编码器")
+            return
+
+        display, ctype, codec, ext, is_hw = info
+        file_filter = f"Video (*{ext});;All (*)"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存视频", "", file_filter)
         if not path:
             return
+        if not path.lower().endswith(ext):
+            path += ext
 
         W, H = self._render_w, self._render_h
         out_fps = self.sp_export_fps.value()
+        bitrate = self.sp_export_br.value()
+        preset = self.cb_export_preset.currentText()
+        crf = self.sp_export_crf.value()
 
-        # ★ 根据格式选择编码器
-        if "无压缩" in fmt_text:
-            # RAW：无损，色彩完全保真，文件较大
-            fourcc = 0  # cv2.VideoWriter_fourcc 按平台自动
-            if path.lower().endswith(('.mp4', '.avi')):
-                if not path.lower().endswith('.avi'):
-                    path = path.rsplit('.', 1)[0] + '.avi'
-            fourcc = cv2.VideoWriter_fourcc(*'DIB ')  # 无压缩 RGB
-        elif "H264" in fmt_text:
-            fourcc = cv2.VideoWriter_fourcc(*'H264')
-            if not path.lower().endswith('.mp4'):
-                path = path.rsplit('.', 1)[0] + '.mp4'
-        elif "mp4v" in fmt_text:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            if not path.lower().endswith('.mp4'):
-                path = path.rsplit('.', 1)[0] + '.mp4'
-        else:  # MJPG
-            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-            if not path.lower().endswith('.avi'):
-                path = path.rsplit('.', 1)[0] + '.avi'
+        self._export_writer = ExportWriter(
+            path, out_fps, W, H, info,
+            bitrate=bitrate, preset=preset, crf=crf)
 
-        self._export_writer = cv2.VideoWriter(path, fourcc, out_fps, (W, H))
-        if not self._export_writer.isOpened():
+        if not self._export_writer.is_opened:
             # H264 不可用时 fallback
-            if "H264" in fmt_text:
-                self._export_writer = cv2.VideoWriter(
-                    path, cv2.VideoWriter_fourcc(*'mp4v'), out_fps, (W, H))
-            if not self._export_writer or not self._export_writer.isOpened():
+            if codec == "H264":
+                fallback = ("MJPEG (fallback)", "opencv", "MJPG", ".avi",
+                            False)
+                path2 = path.rsplit('.', 1)[0] + '.avi'
+                self._export_writer = ExportWriter(
+                    path2, out_fps, W, H, fallback)
+            if not self._export_writer.is_opened:
                 self.lb_export.setText("创建失败!")
                 self._export_writer = None
                 return
@@ -974,7 +1266,6 @@ class VideoPlayer(QMainWindow):
         total_duration = self.td[-1].elapsedTimeFromStart
         self._export_total = max(1, int(total_duration * out_fps))
         self._export_out_fps = out_fps
-
         self._exporting = True
         self._export_idx = 0
 
@@ -989,8 +1280,7 @@ class VideoPlayer(QMainWindow):
         self.sld_export.setEnabled(True)
         self.sld_export.setRange(0, self._export_total - 1)
         self.lb_export.setText(
-            f"导出中 0/{self._export_total} "
-            f"({total_duration:.1f}s)")
+            f"导出中 0/{self._export_total} ({total_duration:.1f}s)")
 
         self._export_timer = QTimer()
         self._export_timer.setInterval(1)
@@ -999,9 +1289,7 @@ class VideoPlayer(QMainWindow):
 
         print(f"[导出] {path}  {W}×{H}  {out_fps}FPS  "
               f"时长{total_duration:.1f}s  总帧{self._export_total}  "
-              f"格式:{fmt_text}  暗化:{'关' if self.chk_export_no_dark.isChecked() else '开'}")
-
-    # ── 修改：导出单步 ──
+              f"编码器:{display}  {'(HW)' if is_hw else '(SW)'}")
 
     def _export_tick(self):
         if not self._exporting or self._export_writer is None:
@@ -1009,7 +1297,7 @@ class VideoPlayer(QMainWindow):
             return
 
         batch = self.sp_export_batch.value()
-        no_dark = self.chk_export_no_dark.isChecked()   # ★
+        no_dark = self.chk_export_no_dark.isChecked()
 
         for _ in range(batch):
             if self._export_idx >= self._export_total:
@@ -1019,9 +1307,12 @@ class VideoPlayer(QMainWindow):
             time_sec = self._export_idx / self._export_out_fps
             self.fi = self._time_to_fi(time_sec)
 
-            frame = self._build_frame(no_dark=no_dark)  # ★
+            frame = self._build_frame(no_dark=no_dark)
             if frame is not None:
-                self._export_writer.write(frame)
+                if not self._export_writer.write(frame):
+                    self.lb_export.setText("写入失败!")
+                    self._export_stop()
+                    return
 
             self._export_idx += 1
 
@@ -1125,7 +1416,6 @@ class VideoPlayer(QMainWindow):
                 self._toggle_play()
             return
 
-        # 导出期间跳过播放逻辑
         if self._exporting:
             return
 
@@ -1210,7 +1500,6 @@ class VideoPlayer(QMainWindow):
                              scale_mult=scale_mult)
 
     def _build_frame(self, no_dark=False):
-        """渲染当前帧。no_dark=True 时强制关闭暗化（导出用）"""
         if not self.td:
             return None
 
@@ -1250,7 +1539,6 @@ class VideoPlayer(QMainWindow):
         current_lap = p.lapNumber
         vf = self._get_video_frame()
 
-        # 背景
         if show_bg:
             if src_bg == "Video":
                 bg = (fill_cover(vf, W, H) if vf is not None
@@ -1266,7 +1554,6 @@ class VideoPlayer(QMainWindow):
         else:
             bg = np.full((H, W, 3), (18, 18, 18), np.uint8)
 
-        # 布局
         pw = max(60, int(W * panel_r))
         ph = max(60, H - fm * 2)
         viewport_w = max(20, pw - fm * 2)
@@ -1327,7 +1614,6 @@ class VideoPlayer(QMainWindow):
                     and yo + rh2 <= seg_h and xo + rw2 <= viewport_w):
                 seg_frame[yo:yo + rh2, xo:xo + rw2] = seg_raw
 
-        # ★ 暗化：导出时可强制关闭
         if no_dark:
             need_darken = False
         else:
@@ -1367,8 +1653,6 @@ class VideoPlayer(QMainWindow):
         if self.vs.ok:
             parts.append(f"V {self.vs.pos:.1f}s")
         self.lb_i.setText(" | ".join(parts))
-
-        # 进度条同步
         self.sld.blockSignals(True)
         self.sld.setValue(idx)
         self.sld.blockSignals(False)
@@ -1411,12 +1695,12 @@ class VideoPlayer(QMainWindow):
             self._min_lap, self._max_lap, self._num_laps = get_lap_info(
                 self.td)
             self.lb_seg.setText(
-                f"XML: {self._num_laps} 圈 (Lap {self._min_lap}"
+                f"XML: {self._num_laps} 段 (Lap {self._min_lap}"
                 f"~{self._max_lap})")
-            self.lb_seg_detail.setText("加载图片后自动按圈数分段")
+            self.lb_seg_detail.setText("加载图片后自动分段")
             self._render_and_show()
             self._upd_time()
-            print(f"[XML] {len(self.td)} 点  {self._num_laps} 圈 "
+            print(f"[XML] {len(self.td)} 点  {self._num_laps} 段 "
                   f"(Lap {self._min_lap}~{self._max_lap})")
 
     def _open_vid(self):

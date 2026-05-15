@@ -1,11 +1,13 @@
 # TrackCam
 将QuickRoute处理好的数据转换成视频
 
-[English](README.md)
+[中文](README_ZH.md) | [English](README.md)
 
 ## 安装
 
 ```
+winget install ffmpeg   # 安装ffmpeg，导出视频文件
+
 git clone https://github.com/yaneeee/trackcam.git
 cd trackcam
 pip install -r requirements.txt

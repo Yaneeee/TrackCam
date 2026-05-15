@@ -1,11 +1,13 @@
 # TrackCam
 Transform QuickRoute file to video.
 
-[Chinese](README_ZH.md)
+[中文](README_ZH.md) | [English](README.md)
 
 ## Install
 
 ```
+winget install ffmpeg # install ffmpeg to export video
+
 git clone https://github.com/yaneeee/trackcam.git
 cd trackcam
 pip install -r requirements.txt
