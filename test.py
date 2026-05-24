@@ -1,18 +1,23 @@
 import sys
+import os
 import time
+import bisect
 import subprocess
 import shutil
+import threading
+import queue
 import cv2
 import numpy as np
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Dict
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QSlider, QLabel, QComboBox, QFileDialog, QDoubleSpinBox,
-    QSpinBox, QGroupBox, QFormLayout, QColorDialog, QScrollArea, QCheckBox
+    QSpinBox, QGroupBox, QFormLayout, QColorDialog, QScrollArea, QCheckBox,
+    QMessageBox
 )
 
 
@@ -56,7 +61,6 @@ def _probe_ffmpeg():
 
 FFMPEG_OK, FFMPEG_ENC = _probe_ffmpeg()
 
-# (显示名, 类型, 编码器标识, 默认扩展名, 是否硬件)
 _CODEC_DEFS = [
     ("H.264 (软件)",       "opencv", "H264",          ".mp4", False),
     ("MPEG-4 (XVID)",      "opencv", "XVID",          ".avi", False),
@@ -119,8 +123,6 @@ def _preset_family(codec: str) -> str:
 # ═══════════════════ FFmpeg 编码器 ═══════════════════
 
 class FFmpegWriter:
-    """通过 ffmpeg 子进程 pipe 帧数据，支持硬件加速编码"""
-
     def __init__(self, path, fps, w, h, codec,
                  bitrate_kbps=0, preset="", crf=-1):
         cmd = [
@@ -139,20 +141,40 @@ class FFmpegWriter:
         pv = preset.strip()
         if pv and pv != "default":
             if fam == "vp9":
-                cmd += ["-deadline", pv,
-                        "-cpu-used",
-                        {"realtime": "5", "good": "2", "best": "0"
-                         }.get(pv, "2")]
+                cmd += ["-deadline", pv, "-cpu-used",
+                        {"realtime": "5", "good": "2",
+                         "best": "0"}.get(pv, "2")]
             else:
                 cmd += ["-preset", pv]
 
+        has_quality = False
         if bitrate_kbps > 0:
             cmd += ["-b:v", f"{bitrate_kbps}k"]
-        elif crf >= 0:
+            has_quality = True
+        if crf >= 0:
             if fam == "nvenc":
                 cmd += ["-cq", str(crf)]
+            elif fam == "qsv":
+                cmd += ["-global_quality", str(crf)]
             else:
                 cmd += ["-crf", str(crf)]
+            has_quality = True
+
+        if not has_quality:
+            default_crf = {
+                "nvenc": 20, "qsv": 22, "vaapi": 23,
+                "amf": 22, "vt": 20,
+                "x26x": 18, "vp9": 30, "av1": 28,
+            }.get(fam, 20)
+            if fam == "nvenc":
+                cmd += ["-cq", str(default_crf)]
+            elif fam == "qsv":
+                cmd += ["-global_quality", str(default_crf)]
+            else:
+                cmd += ["-crf", str(default_crf)]
+
+        # ★ 让 FFmpeg 用满所有 CPU 线程编码
+        cmd += ["-threads", "0"]
 
         if fam == "qsv":
             cmd += ["-pix_fmt", "nv12"]
@@ -185,7 +207,7 @@ class FFmpegWriter:
         except Exception:
             pass
         try:
-            _, err = self._proc.communicate(timeout=15)
+            _, err = self._proc.communicate(timeout=30)
             if self._proc.returncode != 0:
                 print(f"[FFmpeg 错误] {err.decode(errors='replace')[:500]}")
         except subprocess.TimeoutExpired:
@@ -194,11 +216,7 @@ class FFmpegWriter:
         self._proc = None
 
 
-# ═══════════════════ 统一导出写入器 ═══════════════════
-
 class ExportWriter:
-    """统一 OpenCV / FFmpeg 写入接口"""
-
     def __init__(self, path, fps, w, h, codec_info,
                  bitrate=0, preset="", crf=-1):
         _display, self._ctype, self._codec, _ext, _hw = codec_info
@@ -219,12 +237,61 @@ class ExportWriter:
     def write(self, frame):
         if self._ctype == "ffmpeg":
             return self._w.write(frame)
-        else:
-            self._w.write(frame)
-            return True
+        self._w.write(frame)
+        return True
 
     def release(self):
         self._w.release()
+
+
+# ═══════════════════ ★ 异步写入线程 ═══════════════════
+
+class ThreadedExportWriter:
+    """后台线程负责编码写入，主线程只管渲染 → 两者并行"""
+    def __init__(self, writer: ExportWriter, buf_size: int = 60):
+        self._writer = writer
+        self._q: queue.Queue = queue.Queue(maxsize=buf_size)
+        self._done = threading.Event()
+        self._err = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while True:
+            item = self._q.get()
+            if item is None:
+                break
+            try:
+                if not self._writer.write(item):
+                    self._err.set()
+                    break
+            except Exception as e:
+                print(f"[ThreadedWriter] {e}")
+                self._err.set()
+                break
+        self._done.set()
+
+    @property
+    def is_opened(self):
+        return not self._err.is_set() and self._writer.is_opened
+
+    def write(self, frame) -> bool:
+        if self._err.is_set():
+            return False
+        try:
+            self._q.put(frame.copy(), timeout=30)
+            return True
+        except queue.Full:
+            self._err.set()
+            return False
+
+    def release(self):
+        try:
+            self._q.put(None, timeout=5)
+        except queue.Full:
+            pass
+        self._thread.join(timeout=120)
+        self._writer.release()
 
 
 # ═══════════════════ 数据 ═══════════════════
@@ -279,6 +346,7 @@ class VideoSource:
         self.height = 0
         self._frame: Optional[np.ndarray] = None
         self._pos = 0.0
+        self.path = ""
 
     @property
     def ok(self):
@@ -290,9 +358,11 @@ class VideoSource:
         if not self.cap.isOpened():
             self.cap = None
             return False
+        self.path = path
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.duration = self.total_frames / self.fps if self.fps > 0 else 0
+        self.duration = (self.total_frames / self.fps
+                         if self.fps > 0 else 0)
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         ok, f = self.cap.read()
@@ -339,8 +409,14 @@ class VideoSource:
 # ═══════════════════ 帧缓冲 ═══════════════════
 
 class FrameBuffer:
+    """★ 多缓冲区复用：output / bg / zeros 各有独立缓存"""
+
     def __init__(self):
         self.output = None
+        self._bg = None          # fill_cover 专用
+        self._bg_shape = (0, 0)
+        self._dark = None        # 暗色背景
+        self._dark_shape = (0, 0)
         self._zeros = {}
         self._shape = (0, 0)
 
@@ -350,6 +426,19 @@ class FrameBuffer:
             self._shape = (H, W)
         return self.output
 
+    def bg_buf(self, H, W):
+        """★ 复用背景缓冲区，避免每帧 malloc"""
+        if self._bg_shape != (H, W):
+            self._bg = np.empty((H, W, 3), np.uint8)
+            self._bg_shape = (H, W)
+        return self._bg
+
+    def dark_bg(self, W, H):
+        if self._dark_shape != (H, W):
+            self._dark = np.full((H, W, 3), (18, 18, 18), np.uint8)
+            self._dark_shape = (H, W)
+        return self._dark
+
     def zeros(self, shape):
         if shape not in self._zeros:
             self._zeros[shape] = np.zeros(shape, np.uint8)
@@ -357,13 +446,22 @@ class FrameBuffer:
 
     def reset(self):
         self.output = None
+        self._bg = None
+        self._dark = None
         self._zeros.clear()
         self._shape = (0, 0)
+        self._bg_shape = (0, 0)
+        self._dark_shape = (0, 0)
 
 
-# ═══════════════════ 蒙版 ═══════════════════
+# ═══════════════════ 蒙版 + 叠加 ═══════════════════
 
-_mc = {}
+_mc: dict = {}
+
+
+def clear_mask_cache():
+    """★ 窗口尺寸变化或关闭时清理蒙版缓存"""
+    _mc.clear()
 
 
 def _mask(h, w):
@@ -463,38 +561,60 @@ def overlay_rounded_rect(canvas, patch, cx, cy, radius,
     _draw_rr_border(canvas, cx, cy, pw, ph, radius, border_color, bw)
 
 
-# ═══════════════════ 工具 ═══════════════════
+# ═══════════════════ 工具函数 ═══════════════════
 
-def resize_fit(frame, tw, th):
+def resize_fit(frame, tw, th, out=None):
+    """★ 可选 out 缓冲区复用"""
     if frame is None:
+        if out is not None and out.shape == (th, tw, 3):
+            out[:] = 0
+            return out
         return np.zeros((th, tw, 3), np.uint8)
     h, w = frame.shape[:2]
     if w == 0 or h == 0:
+        if out is not None and out.shape == (th, tw, 3):
+            out[:] = 0
+            return out
         return np.zeros((th, tw, 3), np.uint8)
     s = min(tw / w, th / h)
     nw = max(1, int(round(w * s)))
     nh = max(1, int(round(h * s)))
     r = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
-    c = np.zeros((th, tw, 3), np.uint8)
+    if out is not None and out.shape == (th, tw, 3):
+        out[:] = 0
+        dst = out
+    else:
+        dst = np.zeros((th, tw, 3), np.uint8)
     yo, xo = (th - nh) // 2, (tw - nw) // 2
     if yo >= 0 and xo >= 0 and yo + nh <= th and xo + nw <= tw:
-        c[yo:yo + nh, xo:xo + nw] = r
-    return c
+        dst[yo:yo + nh, xo:xo + nw] = r
+    return dst
 
 
-def fill_cover(frame, tw, th):
+def fill_cover(frame, tw, th, out=None):
+    """★ 可选 out 缓冲区复用"""
     if frame is None:
-        return np.zeros((th, tw, 3), np.uint8)
+        if out is not None and out.shape == (th, tw, 3):
+            out[:] = 18
+            return out
+        return np.full((th, tw, 3), (18, 18, 18), np.uint8)
     h, w = frame.shape[:2]
     if w == 0 or h == 0:
-        return np.zeros((th, tw, 3), np.uint8)
+        if out is not None and out.shape == (th, tw, 3):
+            out[:] = 18
+            return out
+        return np.full((th, tw, 3), (18, 18, 18), np.uint8)
     s = max(tw / w, th / h)
     nw = max(tw, int(round(w * s)))
     nh = max(th, int(round(h * s)))
     r = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
     yo = max(0, (nh - th) // 2)
     xo = max(0, (nw - tw) // 2)
-    return r[yo:yo + th, xo:xo + tw].copy()
+    crop = r[yo:yo + th, xo:xo + tw]
+    if out is not None and out.shape == crop.shape:
+        out[:] = crop
+        return out
+    return crop.copy()
 
 
 def safe_imread(path):
@@ -508,33 +628,74 @@ def safe_imread(path):
     return cv2.imread(path)
 
 
-# ═══════════════════ 渲染引擎 (CUDA 加速) ═══════════════════
+# ═══════════════════ 渲染引擎 ═══════════════════
 
 class RenderEngine:
+    """★ 三项优化:
+    1. 共享地图数据（类级别），三个引擎不重复存图
+    2. warpAffine 结果缓存，变换矩阵微变时复用
+    3. CUDA warp 加速
+    """
+
+    # ── 共享地图 ──
+    _shared_img = None
+    _shared_gpu = None
+    _shared_path = ""
+
+    # 仿射缓存阈值（子像素级）
+    _POS_THR = 0.3
+
     def __init__(self):
         self.map_img = None
         self._map_gpu = None
         self._sc = self._sa = self._ss = None
+        # warp 缓存
+        self._wc = None
+        self._wc_M = None
+        self._wc_sz = None
 
     def load_map(self, path):
+        # ★ 共享：同路径不重复加载
+        if (RenderEngine._shared_path == path
+                and RenderEngine._shared_img is not None):
+            self.map_img = RenderEngine._shared_img
+            self._map_gpu = RenderEngine._shared_gpu
+            self._wc = None
+            return True
+
         try:
             data = np.fromfile(path, dtype=np.uint8)
-            self.map_img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            img = cv2.imdecode(data, cv2.IMREAD_COLOR)
         except Exception:
-            self.map_img = None
-        # 上传到 GPU 缓存
-        if CUDA_OK and self.map_img is not None:
+            return False
+        if img is None:
+            return False
+
+        RenderEngine._shared_img = img
+        RenderEngine._shared_path = path
+        self.map_img = img
+
+        if CUDA_OK:
             try:
-                self._map_gpu = cv2.cuda_GpuMat()
-                self._map_gpu.upload(self.map_img)
+                gpu = cv2.cuda_GpuMat()
+                gpu.upload(img)
+                RenderEngine._shared_gpu = gpu
             except Exception:
-                self._map_gpu = None
+                RenderEngine._shared_gpu = None
         else:
-            self._map_gpu = None
-        return self.map_img is not None
+            RenderEngine._shared_gpu = None
+
+        self._map_gpu = RenderEngine._shared_gpu
+        self._wc = None
+        self._wc_M = None
+        self._wc_sz = None
+        return True
 
     def reset(self):
         self._sc = self._sa = self._ss = None
+        self._wc = None
+        self._wc_M = None
+        self._wc_sz = None
 
     @staticmethod
     def interp(td, fi):
@@ -556,6 +717,7 @@ class RenderEngine:
                ox, oy, ps, lw, lc, lerp, margin, scale_mult=1.0):
         tw, th = size
         cx, cy = ix + ox, iy + oy
+
         if mode == "LapView" and len(laps) > 1:
             ap = np.array([[p.imageX + ox, p.imageY + oy] for p in laps],
                           np.float32)
@@ -563,15 +725,16 @@ class RenderEngine:
             tc = (mn + mx) / 2
             p0, p1 = laps[0], laps[-1]
             ta = np.degrees(np.arctan2(
-                p1.imageY + oy - p0.imageY - oy,
-                p1.imageX + ox - p0.imageX - ox)) + 90
+                p1.imageY - p0.imageY, p1.imageX - p0.imageX)) + 90
             ts = min(tw / max(1, mx[0] - mn[0]),
                      th / max(1, mx[1] - mn[1])) * margin
         elif mode == "NorthUp":
             tc, ta, ts = np.array([cx, cy]), 0.0, 1.0
         else:
             tc, ta, ts = np.array([cx, cy]), idir, 1.0
+
         ts *= scale_mult
+
         if self._sc is None:
             self._sc = (tc.copy() if isinstance(tc, np.ndarray)
                         else np.array(tc))
@@ -585,25 +748,44 @@ class RenderEngine:
             if d < -180:
                 d += 360
             self._sa += d * lerp
+
         M = cv2.getRotationMatrix2D(tuple(self._sc), self._sa, self._ss)
         M[0, 2] += tw / 2 - self._sc[0]
         M[1, 2] += th / 2 - self._sc[1]
 
-        # CUDA 加速 warpAffine
-        if CUDA_OK and self._map_gpu is not None:
-            try:
-                gpu_dst = cv2.cuda.warpAffine(
-                    self._map_gpu, M, (tw, th),
+        # ★ warp 缓存：矩阵变化极小时复用
+        need_warp = True
+        if (self._wc is not None
+                and self._wc_sz == (tw, th)
+                and self._wc_M is not None):
+            if np.max(np.abs(M - self._wc_M)) < self._POS_THR:
+                need_warp = False
+
+        if need_warp:
+            if CUDA_OK and self._map_gpu is not None:
+                try:
+                    gpu_dst = cv2.cuda.warpAffine(
+                        self._map_gpu, M, (tw, th),
+                        flags=cv2.INTER_LINEAR)
+                    clean = gpu_dst.download()
+                except Exception:
+                    clean = cv2.warpAffine(
+                        self.map_img, M, (tw, th),
+                        flags=cv2.INTER_LINEAR)
+            elif self.map_img is not None:
+                clean = cv2.warpAffine(
+                    self.map_img, M, (tw, th),
                     flags=cv2.INTER_LINEAR)
-                fr = gpu_dst.download()
-            except Exception:
-                fr = cv2.warpAffine(self.map_img, M, (tw, th),
-                                    flags=cv2.INTER_LINEAR)
-        elif self.map_img is not None:
-            fr = cv2.warpAffine(self.map_img, M, (tw, th),
-                                flags=cv2.INTER_LINEAR)
+            else:
+                clean = np.zeros((th, tw, 3), np.uint8)
+            self._wc = clean
+            self._wc_M = M.copy()
+            self._wc_sz = (tw, th)
         else:
-            fr = np.zeros((th, tw, 3), np.uint8)
+            clean = self._wc
+
+        # 在缓存副本上画轨迹和位置
+        fr = clean.copy()
 
         if len(trail) > 1:
             d = np.array([[p.imageX + ox, p.imageY + oy] for p in trail],
@@ -612,7 +794,8 @@ class RenderEngine:
             cv2.polylines(fr, [t.astype(np.int32)], False, lc, lw,
                           cv2.LINE_AA)
         tp = cv2.transform(np.array([[[cx, cy]]], np.float32), M)[0][0]
-        cv2.circle(fr, (int(tp[0]), int(tp[1])), ps + 2, (255, 255, 255), -1)
+        cv2.circle(fr, (int(tp[0]), int(tp[1])), ps + 2,
+                   (255, 255, 255), -1)
         cv2.circle(fr, (int(tp[0]), int(tp[1])), ps, (0, 0, 255), -1)
         return fr
 
@@ -692,6 +875,40 @@ def select_roi_on_image(img):
     return (rx, ry, rw, rh)
 
 
+# ═══════════════════ 音频混流 ═══════════════════
+
+def _mux_audio(video_path: str, src_path: str,
+               seek_sec: float = 0.0) -> bool:
+    if not src_path or not os.path.isfile(src_path):
+        return False
+    tmp = video_path + ".tmp_mux.mp4"
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
+    if seek_sec > 0.01:
+        cmd += ["-ss", f"{seek_sec:.3f}"]
+    cmd += [
+        "-i", src_path, "-i", video_path,
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        "-map", "1:v:0", "-map", "0:a:0?", "-shortest", tmp,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if r.returncode == 0 and os.path.isfile(tmp):
+            os.replace(tmp, video_path)
+            return True
+        print(f"[音频] {r.stderr[:400]}")
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+        return False
+    except Exception as e:
+        print(f"[音频] {e}")
+        if os.path.isfile(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return False
+
+
 # ═══════════════════ 主窗口 ═══════════════════
 
 WIN = "Track Viewer"
@@ -721,10 +938,18 @@ class VideoPlayer(QMainWindow):
         self._num_laps = 0
         self._seg_images: Dict[int, np.ndarray] = {}
 
+        # ★ 预计算索引
+        self._times: List[float] = []
+        self._lap_dict: Dict[int, List[TrackPoint]] = {}
+
         self._exporting = False
-        self._export_writer: Optional[ExportWriter] = None
+        self._export_writer: Optional[ThreadedExportWriter] = None
         self._export_idx = 0
         self._export_total = 0
+        self._export_path = ""
+        self._export_src_path = ""
+        self._export_audio_seek = 0.0
+        self._export_start_time = 0.0
 
         self._codec_list = _available_codecs()
 
@@ -758,6 +983,7 @@ class VideoPlayer(QMainWindow):
             if w != self._render_w or h != self._render_h:
                 self._render_w, self._render_h = w, h
                 self.buf.reset()
+                clear_mask_cache()        # ★ 尺寸变化清理蒙版
                 self.sp_dw.blockSignals(True)
                 self.sp_dh.blockSignals(True)
                 self.sp_dw.setValue(w)
@@ -792,13 +1018,11 @@ class VideoPlayer(QMainWindow):
             g.setLayout(f)
             sl.addWidget(g)
 
-        # 文件
         self.btn_map = QPushButton("加载地图")
         self.btn_xml = QPushButton("加载轨迹 XML")
         self.btn_vid = QPushButton("加载视频")
         grp("文件加载", [self.btn_map, self.btn_xml, self.btn_vid])
 
-        # 偏移
         self.ox = QDoubleSpinBox()
         self.ox.setRange(-99999, 99999)
         self.ox.setDecimals(1)
@@ -807,7 +1031,6 @@ class VideoPlayer(QMainWindow):
         self.oy.setDecimals(1)
         grp("地图偏移", [("X:", self.ox), ("Y:", self.oy)])
 
-        # 播放
         self.sp_fps = QSpinBox()
         self.sp_fps.setRange(10, 240)
         self.sp_fps.setValue(60)
@@ -818,7 +1041,6 @@ class VideoPlayer(QMainWindow):
         self.cb_spd.setCurrentText("1x")
         grp("播放控制", [("帧率:", self.sp_fps), ("倍速:", self.cb_spd)])
 
-        # 四视窗
         self.chk_bg = QCheckBox("显示")
         self.chk_bg.setChecked(True)
         self.cb_src_bg = QComboBox()
@@ -858,7 +1080,6 @@ class VideoPlayer(QMainWindow):
         gv.setLayout(fv)
         sl.addWidget(gv)
 
-        # 平滑
         self.sp_lerp = QDoubleSpinBox()
         self.sp_lerp.setRange(0.01, 1.0)
         self.sp_lerp.setSingleStep(0.01)
@@ -872,7 +1093,6 @@ class VideoPlayer(QMainWindow):
         grp("平滑参数", [("插值系数:", self.sp_lerp),
                          ("LapView边距:", self.sp_margin)])
 
-        # 轨迹
         self.sp_ttw = QSpinBox()
         self.sp_ttw.setRange(1, 600)
         self.sp_ttw.setValue(30)
@@ -890,7 +1110,6 @@ class VideoPlayer(QMainWindow):
         grp("轨迹显示", [("回看:", self.sp_ttw), ("线宽:", self.sp_lw),
                          ("点大小:", self.sp_ps), ("颜色:", self.btn_col)])
 
-        # 浮窗
         self.sp_panel = QDoubleSpinBox()
         self.sp_panel.setRange(0.1, 0.8)
         self.sp_panel.setSingleStep(0.05)
@@ -921,7 +1140,6 @@ class VideoPlayer(QMainWindow):
             ("矩形边框:", self.sp_bd),
         ])
 
-        # 视频
         self.chk_darken = QCheckBox("背景暗化")
         self.chk_darken.setChecked(True)
         self.sp_voff = QDoubleSpinBox()
@@ -935,7 +1153,6 @@ class VideoPlayer(QMainWindow):
             self.chk_darken, ("时间偏移:", self.sp_voff), ("信息:", self.lb_vi),
         ])
 
-        # 显示
         self.sp_dw = QSpinBox()
         self.sp_dw.setRange(320, 3840)
         self.sp_dw.setValue(960)
@@ -948,7 +1165,6 @@ class VideoPlayer(QMainWindow):
         self.sp_dh.setSuffix(" px")
         grp("窗口尺寸", [("宽:", self.sp_dw), ("高:", self.sp_dh)])
 
-        # 分段
         self.btn_seg_img = QPushButton("加载图片 → 选区分段")
         self.btn_seg_frame = QPushButton("当前帧 → 选区分段")
         self.sp_seg_pad = QSpinBox()
@@ -968,7 +1184,7 @@ class VideoPlayer(QMainWindow):
         ge.setLayout(fe)
         sl.addWidget(ge)
 
-        # ── 导出视频 (增强版) ──
+        # ── 导出视频 ──
         self.cb_export_codec = QComboBox()
         for display, _ct, _cd, _ext, _hw in self._codec_list:
             tag = " [HW]" if _hw else ""
@@ -983,18 +1199,22 @@ class VideoPlayer(QMainWindow):
         self.sp_export_br.setSuffix(" kbps")
         self.sp_export_crf = QSpinBox()
         self.sp_export_crf.setRange(-1, 63)
-        self.sp_export_crf.setValue(-1)
-        self.sp_export_crf.setSuffix(" (-1=默认)")
+        self.sp_export_crf.setValue(18)
+        self.sp_export_crf.setSuffix(" (-1=自动)")
         self.sp_export_fps = QSpinBox()
         self.sp_export_fps.setRange(10, 120)
         self.sp_export_fps.setValue(60)
         self.sp_export_fps.setSuffix(" FPS")
         self.sp_export_batch = QSpinBox()
-        self.sp_export_batch.setRange(1, 60)
-        self.sp_export_batch.setValue(5)
+        self.sp_export_batch.setRange(1, 120)
+        self.sp_export_batch.setValue(10)
         self.sp_export_batch.setSuffix(" 帧/tick")
         self.chk_export_no_dark = QCheckBox("导出时关闭暗化")
         self.chk_export_no_dark.setChecked(True)
+        self.chk_export_audio = QCheckBox("合并源视频音频")
+        self.chk_export_audio.setChecked(True)
+        self.chk_export_no_preview = QCheckBox("导出时隐藏预览")
+        self.chk_export_no_preview.setChecked(True)
         self.btn_export_start = QPushButton("导出视频")
         self.btn_export_cancel = QPushButton("取消导出")
         self.btn_export_cancel.setEnabled(False)
@@ -1016,6 +1236,8 @@ class VideoPlayer(QMainWindow):
         fe2.addRow("导出帧率:", self.sp_export_fps)
         fe2.addRow("批量帧数:", self.sp_export_batch)
         fe2.addRow(self.chk_export_no_dark)
+        fe2.addRow(self.chk_export_audio)
+        fe2.addRow(self.chk_export_no_preview)
         row_exp = QHBoxLayout()
         row_exp.addWidget(self.btn_export_start)
         row_exp.addWidget(self.btn_export_cancel)
@@ -1064,7 +1286,8 @@ class VideoPlayer(QMainWindow):
         self.btn_seg_frame.clicked.connect(self._seg_from_frame)
         self.btn_export_start.clicked.connect(self._export_start)
         self.btn_export_cancel.clicked.connect(self._export_stop)
-        self.cb_export_codec.currentIndexChanged.connect(self._on_codec_changed)
+        self.cb_export_codec.currentIndexChanged.connect(
+            self._on_codec_changed)
 
         for cb in [self.cb_src_bg, self.cb_src_circ, self.cb_src_rect,
                    self.cb_src_seg]:
@@ -1085,7 +1308,7 @@ class VideoPlayer(QMainWindow):
             if hasattr(w, 'currentTextChanged'):
                 w.currentTextChanged.connect(self._on_param)
 
-    # ── 编码器 UI 联动 ──
+    # ── 编码器 UI ──
 
     def _selected_codec_info(self):
         idx = self.cb_export_codec.currentIndex()
@@ -1105,10 +1328,10 @@ class VideoPlayer(QMainWindow):
         fam = _preset_family(codec)
         presets = _PRESET_MAP.get(fam, ["default"])
         self.cb_export_preset.addItems(presets)
-        if presets:
-            self.cb_export_preset.setCurrentIndex(len(presets) // 2)
-        is_hw = _hw
-        self.sp_export_crf.setEnabled(not is_hw or "nvenc" in codec)
+        # ★ 默认选偏快速的预设
+        mid = max(0, len(presets) - 3)
+        self.cb_export_preset.setCurrentIndex(mid)
+        self.sp_export_crf.setEnabled(not _hw or "nvenc" in codec)
         self.sp_export_br.setEnabled(True)
 
     def _update_hw_label(self):
@@ -1119,7 +1342,7 @@ class VideoPlayer(QMainWindow):
                         if any(k in e for k in ("nvenc", "qsv", "vaapi",
                                                  "amf", "videotoolbox"))]
             if hw_names:
-                parts.append(f"HW编码器: {len(hw_names)}个")
+                parts.append(f"HW: {len(hw_names)}个")
         self.lb_hw.setText(" | ".join(parts))
 
     # ── 分段 ──
@@ -1173,10 +1396,6 @@ class VideoPlayer(QMainWindow):
                   (128, 0, 255), (0, 128, 255)]
         rx, ry, rw, rh = roi
         a = rh / (n + 1)
-        print(f"\n{'=' * 50}")
-        print(f"ROI: ({rx},{ry},{rw},{rh})  圈数:{n}  "
-              f"a={a:.1f}px  段高={2 * a:.1f}px")
-        print(f"{'=' * 50}")
         for idx, sx, sy, sw, sh in segs:
             lap = start_lap + idx
             seg_img = img[sy:sy + sh, sx:sx + sw].copy()
@@ -1185,14 +1404,22 @@ class VideoPlayer(QMainWindow):
             cv2.rectangle(preview, (sx, sy), (sx + sw, sy + sh), c, 2)
             cv2.putText(preview, f"L{lap}", (sx + 4, sy + 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 2, cv2.LINE_AA)
-            print(f"  段{idx:2d} → Lap {lap:3d}  y={sy:5d} h={sh:5d}")
         ph2, pw2 = preview.shape[:2]
         ps2 = min(960 / pw2, 720 / ph2, 1.0)
-        prev = cv2.resize(preview,
-                          (max(1, int(pw2 * ps2)), max(1, int(ph2 * ps2))))
-        cv2.imshow("分段预览 (3秒)", prev)
-        cv2.waitKey(3000)
-        cv2.destroyWindow("分段预览 (3秒)")
+        prev = cv2.resize(
+            preview,
+            (max(1, int(pw2 * ps2)), max(1, int(ph2 * ps2))))
+
+        # ★ 非阻塞预览：保持 Qt 事件循环运行
+        win_name = "分段预览 (3秒/按任意键关闭)"
+        cv2.imshow(win_name, prev)
+        end = time.monotonic() + 3
+        while time.monotonic() < end:
+            QApplication.processEvents()
+            if cv2.waitKey(50) >= 0:
+                break
+        cv2.destroyWindow(win_name)
+
         self.lb_seg.setText(
             f"完成: {n}段 → Lap {start_lap}~{self._max_lap}")
         self.lb_seg_detail.setText(
@@ -1216,7 +1443,7 @@ class VideoPlayer(QMainWindow):
         frac = (time_sec - t1) / (t2 - t1) if t2 > t1 else 0.0
         return lo + max(0.0, min(1.0, frac))
 
-    # ── 导出 (增强版) ──
+    # ── 导出 ──
 
     def _export_start(self):
         if not self.td:
@@ -1246,28 +1473,36 @@ class VideoPlayer(QMainWindow):
         preset = self.cb_export_preset.currentText()
         crf = self.sp_export_crf.value()
 
-        self._export_writer = ExportWriter(
+        self._export_path = path
+        self._export_src_path = self.vs.path if self.vs.ok else ""
+        self._export_audio_seek = self.sp_voff.value()
+
+        base_writer = ExportWriter(
             path, out_fps, W, H, info,
             bitrate=bitrate, preset=preset, crf=crf)
 
-        if not self._export_writer.is_opened:
-            # H264 不可用时 fallback
+        if not base_writer.is_opened:
             if codec == "H264":
-                fallback = ("MJPEG (fallback)", "opencv", "MJPG", ".avi",
-                            False)
+                fallback = ("MJPEG (fallback)", "opencv", "MJPG",
+                            ".avi", False)
                 path2 = path.rsplit('.', 1)[0] + '.avi'
-                self._export_writer = ExportWriter(
-                    path2, out_fps, W, H, fallback)
-            if not self._export_writer.is_opened:
+                self._export_path = path2
+                base_writer = ExportWriter(path2, out_fps, W, H, fallback)
+            if not base_writer.is_opened:
                 self.lb_export.setText("创建失败!")
-                self._export_writer = None
                 return
+
+        # ★ 异步写入线程
+        frame_bytes = W * H * 3
+        buf_sz = max(15, min(120, 256 * 1024 * 1024 // frame_bytes))
+        self._export_writer = ThreadedExportWriter(base_writer, buf_sz)
 
         total_duration = self.td[-1].elapsedTimeFromStart
         self._export_total = max(1, int(total_duration * out_fps))
         self._export_out_fps = out_fps
         self._exporting = True
         self._export_idx = 0
+        self._export_start_time = time.monotonic()
 
         if self.playing:
             self._toggle_play()
@@ -1287,9 +1522,13 @@ class VideoPlayer(QMainWindow):
         self._export_timer.timeout.connect(self._export_tick)
         self._export_timer.start()
 
+        has_audio = (self.chk_export_audio.isChecked()
+                     and self._export_src_path
+                     and os.path.isfile(self._export_src_path))
         print(f"[导出] {path}  {W}×{H}  {out_fps}FPS  "
-              f"时长{total_duration:.1f}s  总帧{self._export_total}  "
-              f"编码器:{display}  {'(HW)' if is_hw else '(SW)'}")
+              f"{total_duration:.1f}s  {self._export_total}帧  "
+              f"{display}  {'HW' if is_hw else 'SW'}  "
+              f"线程缓冲:{buf_sz}  音频:{'是' if has_audio else '否'}")
 
     def _export_tick(self):
         if not self._exporting or self._export_writer is None:
@@ -1298,6 +1537,7 @@ class VideoPlayer(QMainWindow):
 
         batch = self.sp_export_batch.value()
         no_dark = self.chk_export_no_dark.isChecked()
+        no_preview = self.chk_export_no_preview.isChecked()
 
         for _ in range(batch):
             if self._export_idx >= self._export_total:
@@ -1306,31 +1546,41 @@ class VideoPlayer(QMainWindow):
 
             time_sec = self._export_idx / self._export_out_fps
             self.fi = self._time_to_fi(time_sec)
-
             frame = self._build_frame(no_dark=no_dark)
             if frame is not None:
                 if not self._export_writer.write(frame):
                     self.lb_export.setText("写入失败!")
                     self._export_stop()
                     return
-
             self._export_idx += 1
 
+        elapsed = max(0.01, time.monotonic() - self._export_start_time)
+        fps_actual = self._export_idx / elapsed
+        remaining = max(0, (self._export_total - self._export_idx)
+                        / max(0.1, fps_actual))
+        eta_m, eta_s = divmod(int(remaining), 60)
         pct = self._export_idx / self._export_total * 100
-        elapsed_sec = self._export_idx / self._export_out_fps
         self.lb_export.setText(
-            f"导出中 {self._export_idx}/{self._export_total} "
-            f"({pct:.0f}%) {elapsed_sec:.1f}s")
+            f"{self._export_idx}/{self._export_total} "
+            f"({pct:.0f}%) {fps_actual:.0f}fps "
+            f"ETA {eta_m:02d}:{eta_s:02d}")
         self.sld_export.setValue(self._export_idx)
 
-        if self._export_idx % 5 == 0 and frame is not None:
+        if not no_preview and self._export_idx % 30 == 0:
             cv2.imshow(WIN, frame)
             cv2.waitKey(1)
 
     def _export_stop(self):
+        # ★ 防重复调用
+        if not self._exporting and self._export_writer is None:
+            return
+
         if hasattr(self, '_export_timer') and self._export_timer.isActive():
             self._export_timer.stop()
+
         if self._export_writer is not None:
+            self.lb_export.setText("正在刷新编码缓冲...")
+            QApplication.processEvents()
             self._export_writer.release()
             self._export_writer = None
 
@@ -1347,11 +1597,28 @@ class VideoPlayer(QMainWindow):
 
         if done >= total:
             duration = done / max(1, self.sp_export_fps.value())
-            self.lb_export.setText(f"完成! {done}帧 ({duration:.1f}s)")
+            if self.chk_export_audio.isChecked() and self._export_src_path:
+                self.lb_export.setText("正在合并音频...")
+                QApplication.processEvents()
+                ok = _mux_audio(self._export_path, self._export_src_path,
+                                self._export_audio_seek)
+                if ok:
+                    self.lb_export.setText(
+                        f"完成! {done}帧 ({duration:.1f}s) + 音频")
+                else:
+                    self.lb_export.setText(
+                        f"完成! {done}帧 ({duration:.1f}s) (音频失败)")
+            else:
+                self.lb_export.setText(
+                    f"完成! {done}帧 ({duration:.1f}s)")
             print(f"[导出] 完成 {done}帧 ({duration:.1f}s)")
         else:
             self.lb_export.setText(f"已取消 ({done}/{total})")
-            print(f"[导出] 取消 {done}/{total}")
+
+        self._export_path = ""
+        self._export_src_path = ""
+        self._export_audio_seek = 0.0
+        self._export_start_time = 0.0
 
     # ── 辅助 ──
 
@@ -1382,6 +1649,7 @@ class VideoPlayer(QMainWindow):
         self._render_w = self.sp_dw.value()
         self._render_h = self.sp_dh.value()
         self.buf.reset()
+        clear_mask_cache()
         if self._win_created:
             try:
                 cv2.resizeWindow(WIN, self._render_w, self._render_h)
@@ -1400,23 +1668,24 @@ class VideoPlayer(QMainWindow):
     # ── 定时器 ──
 
     def _tick(self):
+        # ★ 导出期间只处理 ESC 按键，不做渲染/同步
+        if self._exporting:
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:
+                self._export_stop()
+            return
+
         key = cv2.waitKey(1) & 0xFF
         if key == 27:
-            if self._exporting:
-                self._export_stop()
-            elif self.playing:
+            if self.playing:
                 self._toggle_play()
             return
         if key == ord(' '):
-            if not self._exporting:
-                self._toggle_play()
+            self._toggle_play()
             return
         if self._win_created and not self._window_alive():
             if self.playing:
                 self._toggle_play()
-            return
-
-        if self._exporting:
             return
 
         sz = self._sync_window_size()
@@ -1446,10 +1715,12 @@ class VideoPlayer(QMainWindow):
     # ── 核心渲染 ──
 
     def _get_video_frame(self):
+        """★ 优化：顺序读取优先，仅大幅回跳时 seek"""
         if not self.vs.ok:
             return None
         if not self.td:
             return self.vs.frame
+
         i1 = int(self.fi)
         i2 = min(i1 + 1, len(self.td) - 1)
         frac = self.fi - i1
@@ -1458,9 +1729,29 @@ class VideoPlayer(QMainWindow):
         vt = tt + self.sp_voff.value()
         diff = vt - self.vs.pos
         fd = 1.0 / self.vs.fps
-        if 0 <= diff < fd * 3:
-            f = self.vs.next()
-            return f if f is not None else self.vs.frame
+
+        # 略微超过 → 当前帧仍是最佳匹配
+        if -fd < diff < fd:
+            return self.vs.frame
+
+        # 向前追赶（正常播放 + 导出的主路径，不 seek）
+        if diff > 0:
+            if diff > 5.0:          # 极大跳跃 → seek
+                return self.vs.seek(max(0, vt))
+            last = self.vs.frame
+            n = max(1, int(diff / fd) + 1)
+            for _ in range(min(n, 120)):
+                if not self.vs.ok:
+                    break
+                f = self.vs.next()
+                if f is None:
+                    break
+                last = f
+                if self.vs.pos >= vt:
+                    break
+            return last
+
+        # 大幅回跳 → seek
         return self.vs.seek(max(0, vt))
 
     def _render_vp(self, engine, source, ix, iy, idir, trail, laps,
@@ -1508,12 +1799,15 @@ class VideoPlayer(QMainWindow):
         idx = min(int(self.fi), len(self.td) - 1)
         p = self.td[idx]
         tw_s = self.sp_ttw.value()
-        trail = [
-            t for t in self.td
-            if (p.elapsedTimeFromStart - tw_s
-                <= t.elapsedTimeFromStart <= p.elapsedTimeFromStart)
-        ]
-        laps = [t for t in self.td if t.lapNumber == p.lapNumber]
+        target_time = p.elapsedTimeFromStart
+
+        # ★ 轨迹回看 O(n) → O(log n) + 圈边界过滤
+        left = bisect.bisect_left(self._times, target_time - tw_s)
+        right = bisect.bisect_right(self._times, target_time)
+        trail = [t for t in self.td[left:right]
+                 if t.lapNumber == p.lapNumber]
+
+        laps = self._lap_dict.get(p.lapNumber, [])
         c = self.tcolor
         lc = (c.blue(), c.green(), c.red())
         ox, oy = self.ox.value(), self.oy.value()
@@ -1537,22 +1831,33 @@ class VideoPlayer(QMainWindow):
         show_seg = self.chk_seg.isChecked()
 
         current_lap = p.lapNumber
-        vf = self._get_video_frame()
 
+        # ★ 仅在有视窗需要 Video 源时才读取视频帧
+        needs_video = (
+            (show_bg and src_bg == "Video")
+            or (show_circ and src_circ == "Video")
+            or (show_rect and src_rect == "Video")
+            or (show_seg and src_seg == "Video")
+        )
+        vf = self._get_video_frame() if needs_video else None
+
+        # ★ 背景使用缓冲区复用
         if show_bg:
             if src_bg == "Video":
-                bg = (fill_cover(vf, W, H) if vf is not None
-                      else np.full((H, W, 3), (18, 18, 18), np.uint8))
+                bg = (fill_cover(vf, W, H, out=self.buf.bg_buf(H, W))
+                      if vf is not None
+                      else self.buf.dark_bg(W, H))
             elif src_bg == "LapSegment":
                 seg = self._get_seg_for_lap(current_lap)
-                bg = (fill_cover(seg, W, H) if seg is not None
-                      else np.full((H, W, 3), (18, 18, 18), np.uint8))
+                bg = (fill_cover(seg, W, H, out=self.buf.bg_buf(H, W))
+                      if seg is not None
+                      else self.buf.dark_bg(W, H))
             else:
                 bg = self.e_bg.render(
                     ix, iy, idir, trail, laps, src_bg,
                     (W, H), ox, oy, ps, lw, lc, lerp, margin)
         else:
-            bg = np.full((H, W, 3), (18, 18, 18), np.uint8)
+            bg = self.buf.dark_bg(W, H)
 
         pw = max(60, int(W * panel_r))
         ph = max(60, H - fm * 2)
@@ -1677,8 +1982,14 @@ class VideoPlayer(QMainWindow):
         p, _ = QFileDialog.getOpenFileName(
             self, "选择底图", "", "Images (*.png *.jpg *.bmp)")
         if p:
-            for e in self.engines:
-                e.load_map(p)
+            # ★ 只加载一次，共享给三个引擎
+            self.e_bg.load_map(p)
+            self.e_circ.map_img = self.e_bg.map_img
+            self.e_circ._map_gpu = self.e_bg._map_gpu
+            self.e_circ._wc = None
+            self.e_rect.map_img = self.e_bg.map_img
+            self.e_rect._map_gpu = self.e_bg._map_gpu
+            self.e_rect._wc = None
             self._on_param()
 
     def _open_xml(self):
@@ -1688,6 +1999,16 @@ class VideoPlayer(QMainWindow):
             self.td = parse_track_points(p)
             if not self.td:
                 return
+
+            # ★ 预计算索引：时间数组 + 分圈字典
+            self._times = [t.elapsedTimeFromStart for t in self.td]
+            self._lap_dict = {}
+            for t in self.td:
+                self._lap_dict.setdefault(t.lapNumber, []).append(t)
+
+            # ★ 清理旧分段
+            self._seg_images.clear()
+
             self.sld.setEnabled(True)
             self.sld.setRange(0, len(self.td) - 1)
             self.fi = 0.0
@@ -1717,9 +2038,18 @@ class VideoPlayer(QMainWindow):
             self.lb_vi.setText("加载失败!")
 
     def closeEvent(self, e):
+        # ★ 导出中关闭需确认
         if self._exporting:
+            ret = QMessageBox.question(
+                self, "确认关闭",
+                "正在导出视频，确定取消并关闭？",
+                QMessageBox.Yes | QMessageBox.No)
+            if ret == QMessageBox.No:
+                e.ignore()
+                return
             self._export_stop()
         cv2.destroyAllWindows()
+        clear_mask_cache()
         self.vs.release()
         self.buf.reset()
         super().closeEvent(e)
